@@ -7,9 +7,9 @@ template: qwen3_nothink
 stage: sft
 do_train: true
 finetuning_type: lora
-lora_rank: 32
-# 仅注入注意力，避免对 MoE 的 experts.* MLP 施加 LoRA 引发重复 ready
-lora_target: q_proj,k_proj,v_proj,o_proj
+lora_rank: 8
+lora_target: q_proj,k_proj
+
 
 ### dataset
 dataset: qwen3_spider_mysql
