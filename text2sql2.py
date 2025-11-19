@@ -15,15 +15,68 @@ def read_schema_csv(path: str) -> pd.DataFrame:
     raise UnicodeDecodeError("csv", b"", 0, 0, f"Failed to decode {path} with tried encodings")
 
 
-def extract_original_column_names(df: pd.DataFrame) -> List[str]:
-    """Return cleaned original_column_name values, or raise if column missing."""
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip BOM/空格，标准化列名。"""
     normalized_columns = [str(col).strip().lstrip("\ufeff") for col in df.columns]
     df.columns = normalized_columns
+    return df
 
-    if "original_column_name" not in df.columns:
+
+def build_column_description_lines(df: pd.DataFrame) -> List[str]:
+    """基于 schema CSV 构造更丰富的列描述行。
+
+    目标：在 prompt 里清晰表达每个列名及其含义/类型/取值说明。
+    优先使用以下列（若存在）：
+      - original_column_name: 原始列名
+      - column_description: 列含义
+      - data_format: 数据类型/格式
+      - value_description: 取值含义
+    回退行为：若缺失其中部分列，则尽量使用已有字段，不报错。
+    """
+
+    df = normalize_columns(df.copy())
+
+    # 尝试获取各字段列，若不存在则返回 None
+    def get_col(name: str) -> pd.Series | None:
+        return df[name] if name in df.columns else None
+
+    col_name_col = get_col("original_column_name")
+    col_desc_col = get_col("column_description")
+    data_fmt_col = get_col("data_format")
+    value_desc_col = get_col("value_description")
+
+    if col_name_col is None:
+        # 没有 original_column_name 就没法可靠构造表结构，和之前行为保持一致
         raise KeyError("original_column_name")
 
-    return df["original_column_name"].dropna().astype(str).tolist()
+    lines: List[str] = []
+    for idx, raw_name in col_name_col.dropna().astype(str).items():
+        name = raw_name.strip()
+        if not name:
+            continue
+
+        parts: List[str] = [f"column `{name}`"]
+
+        if col_desc_col is not None:
+            desc = str(col_desc_col.iloc[idx]).strip()
+            if desc and desc.lower() != "nan":
+                parts.append(f"description: {desc}")
+
+        if data_fmt_col is not None:
+            fmt = str(data_fmt_col.iloc[idx]).strip()
+            if fmt and fmt.lower() != "nan":
+                parts.append(f"data format: {fmt}")
+
+        if value_desc_col is not None:
+            vdesc = str(value_desc_col.iloc[idx]).strip()
+            if vdesc and vdesc.lower() != "nan":
+                parts.append(f"value description: {vdesc}")
+
+        # 合成这一列的完整说明
+        line = "; ".join(parts)
+        lines.append(line)
+
+    return lines
 
 
 SOURCE_JSON = "/root/autodl-tmp/comp/LLaMA-Factory/datasets/minidev/MINIDEV/mini_dev_mysql.json"
@@ -57,7 +110,7 @@ for _, row in df_mini.iterrows():
             column_path = os.path.join(column_mini, item)
             try:
                 content = read_schema_csv(column_path)
-                names = extract_original_column_names(content)
+                column_lines = build_column_description_lines(content)
             except UnicodeDecodeError as err:
                 failed_tables.append((column_path, f"decode_error: {err}"))
                 continue
@@ -66,7 +119,10 @@ for _, row in df_mini.iterrows():
                 continue
 
             table_name = os.path.splitext(item)[0]
-            columns_str = f"Table {table_name} column names: {', '.join(names)}"
+            columns_str = (
+                f"Table {table_name} columns (each line shows column name, description, data format, and value description if available):\n"
+                + "\n".join(f"- {line}" for line in column_lines)
+            )
             column_content.append(columns_str)
 
     if column_content:
