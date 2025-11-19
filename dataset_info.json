@@ -747,7 +747,8 @@
     "file_name": "bird_mini_text2sql_dpo.jsonl",
     "ranking": true,
     "columns": {
-      "prompt": "prompt",
+      "prompt": "instruction",
+      "query": "input",
       "chosen": "chosen",
       "rejected": "rejected"
     }
