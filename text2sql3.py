@@ -7,7 +7,24 @@ FINAL_DATASET_JSON = "datasets/minidev/final_dataset.json"
 SCHEMA_JSON = "datasets/minidev/schema.json"
 OUTPUT_ALPACA = "datasets/minidev/mini_dev_mysql_alpaca_filtered.json"
 
-PROMPT = "You are an expert data analyst. Please write a MySQL query that satisfies the requirement below."
+# 与 text2sql2.py 保持一致：不使用 instruction，全部放入 input 中。
+PROMPT = "请你接下来一步步思考，写出正确的SQL查询语句以满足用户的需求。"  # 留空
+
+# 中文模板，加入 evidence（参考信息）段落，最后重复用户问题并以 ```sql 开始代码块
+TEMPLATE = """你是一名{dialect}专家，现在需要阅读并理解下面的【数据库schema】描述，以及可能用到的【参考信息】，并运用{dialect}知识生成sql语句回答【用户问题】。
+【用户问题】
+{question}
+
+【数据库schema】
+{db_schema}
+
+【参考信息】
+{evidence}
+
+【用户问题】
+{question}
+
+```sql"""
 
 def load_json(path):
     with open(path, 'r', encoding='utf-8') as f:
@@ -106,15 +123,19 @@ def main():
         
         schema_context = "\n".join(create_table_stmts)
         
-        if schema_context:
-            input_text = f"{question}\n{schema_context}"
-        else:
-            input_text = question
-            
+        evidence = item.get("knowledge", "").strip()
+        # 构造模板 prompt
+        input_text = TEMPLATE.format(
+            dialect="MySQL",
+            question=question,
+            db_schema=schema_context,
+            evidence=evidence,
+        )
+
         record = {
             "instruction": PROMPT,
             "input": input_text,
-            "output": sql_text
+            "output": sql_text,
         }
         alpaca_records.append(record)
         processed_count += 1

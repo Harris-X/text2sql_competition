@@ -93,19 +93,19 @@ def main() -> None:
     parser.add_argument(
         "--adapter-path",
         type=str,
-        default="/root/autodl-tmp/comp/LLaMA-Factory/saves/qwen3-coder-30b/lora/bird_sft",
+        default="/root/autodl-tmp/comp/LLaMA-Factory/saves/qwen3-coder-30b/lora/bird_32_sft",
         help="Path to LoRA adapter (optional). If empty, use base model only.",
     )
     parser.add_argument(
         "--sft-data",
         type=str,
-        default="/root/autodl-tmp/comp/LLaMA-Factory/data/bird_mini_text2sql_alpaca.json",
+        default="/root/autodl-tmp/comp/LLaMA-Factory/data/mini_dev_mysql_alpaca.json",
         help="Path to Alpaca SFT dataset used for BIRD text2sql.",
     )
     parser.add_argument(
         "--output",
         type=str,
-        default="/root/autodl-tmp/comp/LLaMA-Factory/data/bird_mini_text2sql_dpo.jsonl",
+        default="/root/autodl-tmp/comp/LLaMA-Factory/data/mini_dev_mysql_dpo.jsonl",
         help="Where to write DPO JSONL.",
     )
     parser.add_argument(
@@ -117,7 +117,7 @@ def main() -> None:
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=512,
+        default=65536,
         help="Max new tokens when generating SQL.",
     )
     parser.add_argument(
@@ -162,7 +162,9 @@ def main() -> None:
         else:
             print(f"Warning: adapter path {adapter_path} does not exist, skip loading adapter.")
 
-    model.to(args.device)
+    if not args.device.startswith("cuda"):
+        model.to(args.device)
+    
     model.eval()
 
     out_path = Path(args.output)
