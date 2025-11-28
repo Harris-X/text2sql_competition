@@ -321,8 +321,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     # 默认路径（允许被命令行覆盖）
-    default_input = '/home/harris/final_for_student/data/test.json'
-    default_output = '/home/harris/final_for_student/result/test.json'
+    default_input = '/root/autodl-tmp/comp/LLaMA-Factory/Alpha-SQL-master/data/test.json'
+    default_output = '/root/autodl-tmp/comp/LLaMA-Factory/Alpha-SQL-master/result/test.json'
     input_path = args.input if args.input else default_input
     output_path = args.output if args.output else default_output
 

@@ -2,7 +2,7 @@ tasks_file_path: "data/preprocessed/mysql_test/dev/tasks.pkl"
 subset_file_path: null
 db_root_dir: "mysql_db"
 n_processes: 1
-max_rollout_steps: 24
+max_rollout_steps: 6
 max_depth: 16
 exploration_constant: 1.414
 save_root_dir: "results/mysql_exp"
@@ -10,7 +10,7 @@ mcts_model_kwargs:
     model: "Qwen3-Coder-30B-A3B-Instruct"
     n: 3
     top_p: 0.8
-    max_tokens: 4096
+    max_tokens: 65536
     temperature: 0.8
     n_strategy: "single"
 reward_model_kwargs: null

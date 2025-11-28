@@ -10,7 +10,7 @@ nohup vllm serve ./Qwen3-Coder-30B-A3B-Instruct \
   --port 9999 \
   -tp 1 \
   --gpu-memory-utilization 0.95 \
-  --max-model-len 32768 > vllm.log 2>&1 &
+  --max-model-len 262144 > vllm.log 2>&1 &
 
 echo "Waiting for vLLM to start..."
 while ! grep -q "Uvicorn running on" vllm.log; do

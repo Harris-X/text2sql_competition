@@ -86,17 +86,29 @@ def select_final_sql_query(results_file_path: str, db_root_dir: str):
     }
 
 def main(args):
-    final_pred_sqls = {}
+    """
+    汇总每个问题的最终 SQL 选择结果。
+    原实现输出为 {question_id: sql} 的字典，这与后续执行脚本 sql_exe.py 期望的
+    list[{"sql_id":..., "sql":...}] 不一致，导致执行阶段出现 INPUT_FORMAT_ERROR。
+    这里改为输出列表，以便直接被 sql_exe.py 消费，无需再做额外转换。
+    """
+    final_pred_sql_list = []
     with ProcessPoolExecutor(max_workers=args.process_num) as executor:
         result_paths = glob.glob(args.results_dir + "/*.pkl")
         future_to_path = {executor.submit(select_final_sql_query, path, args.db_root_dir): path for path in result_paths}
-        
+
         for future in tqdm(as_completed(future_to_path), total=len(future_to_path), desc="Processing results"):
             selected_item = future.result()
-            final_pred_sqls[str(selected_item["question_id"])] = selected_item["sql"]
+            final_pred_sql_list.append({
+                "sql_id": str(selected_item["question_id"]),
+                "sql": selected_item["sql"]
+            })
+
+    # 排序保证稳定性（按 sql_id）
+    final_pred_sql_list.sort(key=lambda x: int(x["sql_id"]))
 
     with open(args.output_path, "w") as f:
-        json.dump(final_pred_sqls, f, indent=4)
+        json.dump(final_pred_sql_list, f, indent=4, ensure_ascii=False)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
