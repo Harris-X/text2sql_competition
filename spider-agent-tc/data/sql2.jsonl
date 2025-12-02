@@ -1,0 +1,1 @@
+{"instance_id": "sql_2", "instruction": "提取1个抽样号码包，2025.7.17-2025.7.23期间付费且不包含721号码包内的用户全量\n输出:gplayerid。", "db_id": "final_algorithm_competition", "external_knowledge": "common_knowledge.md", "knowledge": "", "table_list": ["dim_extract_311381_conf", "dws_argothek_ce1_login_di", "dws_argothek_ce1_cbt2_vplayerid_suserid_di"]}
