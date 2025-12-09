@@ -48,8 +48,8 @@ META_PLAN_PROMPT = """【角色】你是资深数据分析教练，会在编写 
 【任务】
 1. 产出若干个按顺序排列的子问题标题，覆盖过滤、关联、集合构建、聚合/排序等关键逻辑；
 2. 子问题数量可自适应决定，但需落在 {min_sub_steps} 至 {max_sub_steps} 的范围内；
-3. 标题需语义明确、避免重复，必要时引用实体或字段，且与原问题紧密呼应；
-4. 每个标题需自洽，不能依赖原问题的隐含信息，应包含完成该子任务所需的最小背景。
+3. 子问题需语义明确、避免重复，必要时引用实体或字段，且与原问题紧密呼应；
+4. 每个子问题需自洽，不能依赖原问题的隐含信息，应包含完成该子任务所需的最小完整的语义背景。
 【输出格式】
 ```json
 {{"sub_questions": ["子问题1", "子问题2", ...]}}
@@ -460,7 +460,13 @@ class StepExecutor:
     ) -> StepSQLResult:
         if step.meta:
             dialogues.append({"role": "user", "content": "[META] 第0步：高层规划与子问题分解。"})
-            dialogues.append({"role": "assistant", "content": json.dumps({"ack_meta": True}, ensure_ascii=False)})
+            dialogues.append(
+                {
+                    "role": "note",
+                    "content": json.dumps({"ack_meta": True}, ensure_ascii=False),
+                    "meta": {"exclude_from_history": True, "prompt_type": "META_ACK"},
+                }
+            )
             return StepSQLResult(step, sql="", status="meta", rows_sample=[])
 
         enriched_context = context.copy()
@@ -576,7 +582,7 @@ class StepExecutor:
         elif not is_final_step:
             norm_final = re.sub(r"\s+", " ", final_sql.strip()).lower()
             norm_sql = re.sub(r"\s+", " ", sql.strip()).lower()
-            if norm_sql == norm_final or "count(" in norm_sql or "group by" in norm_sql:
+            if norm_sql == norm_final:
                 scope_prompt = SCOPE_REVISION_PROMPT.format(step_desc=step.desc, current_sql=sql)
                 dialogues.append(
                     {
@@ -1290,23 +1296,23 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_file", required=True)
     parser.add_argument("--output_file", required=True)
-    parser.add_argument("--min_steps", type=int, default=2)
-    parser.add_argument("--max_steps", type=int, default=4)
+    parser.add_argument("--min_steps", type=int, default=3)
+    parser.add_argument("--max_steps", type=int, default=8)
     parser.add_argument("--variants_per_question", type=int, default=1)
-    parser.add_argument("--max_step_retries", type=int, default=5)
-    parser.add_argument("--limit", type=int, default=-1)
-    parser.add_argument("--llm_model", default="")
+    parser.add_argument("--max_step_retries", type=int, default=3)
+    parser.add_argument("--limit", type=int, default=1)
+    parser.add_argument("--llm_model", default="qwen3-coder-480b-a35b-instruct")
     parser.add_argument("--decompose_temperature", type=float, default=0.2)
     parser.add_argument("--sqlgen_temperature", type=float, default=0.3)
     parser.add_argument("--revise_temperature", type=float, default=0.1)
     parser.add_argument("--reflection_rounds", type=int, default=0)
-    parser.add_argument("--reflection_model", default="")
-    parser.add_argument("--detection_model", default="")
+    parser.add_argument("--reflection_model", default="gpt-5.1-thinking")
+    parser.add_argument("--detection_model", default="gpt-5.1-thinking")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--endpoint_type", choices=["auto", "online", "vllm", "offline"], default="auto")
-    parser.add_argument("--corrections_file", default="")
-    parser.add_argument("--openai_base_url", default="")
-    parser.add_argument("--openai_api_key", default="")
+    parser.add_argument("--corrections_file", default="corrections_log.jsonl")
+    parser.add_argument("--openai_base_url", default="https://api.gptbest.vip/v1")
+    parser.add_argument("--openai_api_key", default="sk-GMYNUCidV96DStXskUpPqgemoaDur0alDXZkeyiq5E3mXGZn")
     args = parser.parse_args()
 
     resolve_endpoint(args)
