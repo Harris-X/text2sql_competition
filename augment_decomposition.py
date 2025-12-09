@@ -23,7 +23,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 from decimal import Decimal
 
@@ -40,20 +40,21 @@ load_dotenv(override=True)
 
 META_PLAN_PROMPT = """【角色】你是资深数据分析教练，会在编写 SQL 之前拆解任务。
 【输入】
-- 目标总步数：{n_steps}（第 0 步固定为元规划）
+- 目标总步数上限：{max_steps}（第 0 步固定为元规划）
 - 用户问题：见下文
 - 数据库 schema：见下文
 - 参考信息：见下文
 - 原问题 SQL 答案：见下文
 【任务】
-1. 产出 {sub_steps} 个按顺序排列的子问题标题，覆盖过滤、关联、集合构建、聚合/排序等关键逻辑；
-2. 标题需语义明确、避免重复，必要时引用实体或字段；
-3. 所有内容使用中文，且与原问题紧密呼应。
+1. 产出若干个按顺序排列的子问题标题，覆盖过滤、关联、集合构建、聚合/排序等关键逻辑；
+2. 子问题数量可自适应决定，但需落在 {min_sub_steps} 至 {max_sub_steps} 的范围内；
+3. 标题需语义明确、避免重复，必要时引用实体或字段，且与原问题紧密呼应；
+4. 每个标题需自洽，不能依赖原问题的隐含信息，应包含完成该子任务所需的最小背景。
 【输出格式】
 ```json
 {{"sub_questions": ["子问题1", "子问题2", ...]}}
 ```
-数组长度必须等于 {sub_steps}。
+子问题数组长度需满足 {min_sub_steps} ≤ N ≤ {max_sub_steps}。
 
 【用户问题】
 {user_question}
@@ -119,6 +120,16 @@ EXECUTOR_SYSTEM_PROMPT = "【角色】资深 MySQL 工程师，负责逐步生�
     "【要求】始终结合对话历史，输出严格 JSON（含 SQL 字段），遵循 MySQL 只读查询规范。"
 REFLECTION_SYSTEM_PROMPT = "【角色】资深 MySQL 专家，负责基于历史对话复核并修正每个步骤 SQL。" \
     "【要求】仅输出 JSON 结论或修正，确保与整体意图一致。"
+
+
+DETECTION_FINAL_STEP_PROMPT = "【角色】资深数据分析专家，负责检测当前步骤的俩个 MYSQL 是否等价 。" \
+    "【用户问题】\n{step_desc}\n" \
+    "【数据库schema】\n{schema_text}\n" \
+    "【参考信息】\n{ref_text}\n" \
+    "FINAL GENERATED SQL: {final_generated_sql} ; ORIGINAL FINAL SQL: {original_final_sql} " \
+    "【要求】仅输出 JSON 结论，格式：{{'are_equivalent': true}} 或 {{'are_equivalent': false, 'reason': '不等价原因'}} 。"
+
+
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -290,15 +301,19 @@ class StepPlanner:
     def __init__(self, llm_client: Optional[LLMClient]):
         self.llm_client = llm_client
 
-    def plan(self, context: Dict[str, str], n_steps: int, final_sql: str, offline: bool) -> List[StepPlan]:
+    def plan(self, context: Dict[str, str], min_steps: int, max_steps: int, final_sql: str, offline: bool) -> List[StepPlan]:
         print("[planner] planning steps...")
+        min_sub_steps = max(1, min_steps - 1)
+        max_sub_steps = max(min_sub_steps, max_steps - 1)
+
         if offline or not self.llm_client:
             print("[planner] offline mode or no LLM client, using heuristic planning")
-            return self._offline_plan(context, n_steps, final_sql)
-        sub_steps = max(1, n_steps - 1)
+            return self._offline_plan(context, min_sub_steps, max_sub_steps, final_sql)
+
         prompt = META_PLAN_PROMPT.format(
-            n_steps=n_steps,
-            sub_steps=sub_steps,
+            max_steps=max_steps,
+            min_sub_steps=min_sub_steps,
+            max_sub_steps=max_sub_steps,
             user_question=context.get("user_question", ""),
             schema_text=context.get("schema_text", ""),
             ref_text=context.get("ref_text", ""),
@@ -309,11 +324,11 @@ class StepPlanner:
             response = self.llm_client.invoke(prompt, max_tokens=1024)
             print("[planner] meta planning response: {}".format(response))
             titles = (safe_json_loads(response) or {}).get("sub_questions", [])
-            if isinstance(titles, list) and len(titles) == sub_steps:
+            if isinstance(titles, list) and min_sub_steps <= len(titles) <= max_sub_steps:
                 return self._wrap_titles(context, titles)
         except Exception as exc:
             print(f"[planner] meta planning failed, fallback to heuristics: {exc}")
-        return self._offline_plan(context, n_steps, final_sql)
+        return self._offline_plan(context, min_sub_steps, max_sub_steps, final_sql)
 
     def _wrap_titles(self, context: Dict[str, str], titles: List[str]) -> List[StepPlan]:
         plans = [self._meta_step(context.get("user_question", ""))]
@@ -328,9 +343,10 @@ class StepPlanner:
             )
         return plans
 
-    def _offline_plan(self, context: Dict[str, str], n_steps: int, final_sql: str) -> List[StepPlan]:
+    def _offline_plan(self, context: Dict[str, str], min_sub_steps: int, max_sub_steps: int, final_sql: str) -> List[StepPlan]:
         user_q = context.get("user_question", "")
-        titles = self._heuristic_titles(final_sql, n_steps - 1)
+        need = max(max_sub_steps, min_sub_steps)
+        titles = self._heuristic_titles(final_sql, need)
         plans = [self._meta_step(user_q)]
         for idx, title in enumerate(titles):
             dep = random.random() < 0.4
@@ -741,12 +757,21 @@ class AugmentationAgent:
 
         if args.offline:
             self.reflection_client = None
+            self.detection_client = None
         else:
             ref_model = args.reflection_model if args.reflection_model else args.llm_model
             if ref_model == args.llm_model:
                 self.reflection_client = llm_client
             else:
                 self.reflection_client = LLMClient(ref_model, default_temperature=0.1)
+
+            detection_model = args.detection_model if args.detection_model else args.llm_model
+            if detection_model == args.llm_model:
+                self.detection_client = llm_client
+            elif detection_model == ref_model and self.reflection_client is not None:
+                self.detection_client = self.reflection_client
+            else:
+                self.detection_client = LLMClient(detection_model, default_temperature=0.0)
 
     def process_dataset(self, records: List[Dict[str, Any]]):
         total = 0
@@ -771,14 +796,22 @@ class AugmentationAgent:
 
         variants: List[Dict[str, Any]] = []
         for vidx in range(self.args.variants_per_question):
-            n_steps = random.randint(self.args.min_steps, self.args.max_steps)
-            steps = self.planner.plan(context_raw, n_steps, final_sql, self.args.offline)
-            dialogues: List[Dict[str, Any]] = [
-                {
-                    "role": "note",
-                    "content": f"endpoint={self.args.endpoint_type_resolved}, model={self.args.model_used}, base_url={self.args.openai_base_url}",
-                }
-            ]
+            steps = self.planner.plan(
+                context_raw,
+                self.args.min_steps,
+                self.args.max_steps,
+                final_sql,
+                self.args.offline,
+            )
+            if not steps:
+                print("[augment] planner returned empty steps, skipping variant")
+                continue
+            n_steps = len(steps)
+            dialogues: List[Dict[str, Any]] = []
+            self._append_note_dialogue(
+                dialogues,
+                f"endpoint={self.args.endpoint_type_resolved}, model={self.args.model_used}, base_url={self.args.openai_base_url}",
+            )
 
             # 记录执行代理的系统提示与上下文种子，确保对话日志完整
             dialogues.append({"role": "system", "content": EXECUTOR_SYSTEM_PROMPT})
@@ -811,6 +844,12 @@ class AugmentationAgent:
             validated_sqls = [r.sql for r in step_results]
 
             final_sql_generated = self._synthesize_final(context_raw, steps, validated_sqls, final_sql, dialogues)
+            final_sql_match, final_sql_reason = self._evaluate_final_sql(
+                context_raw,
+                final_sql_generated,
+                final_sql,
+                dialogues,
+            )
             step_sql_versions = [
                 {
                     "step_index": idx,
@@ -833,6 +872,7 @@ class AugmentationAgent:
                 "step_rows_sample": [res.rows_sample for res in step_results],
                 "step_sql_versions": step_sql_versions,
                 "dialogues": dialogues,
+                "dialogues_history_clean": self._dialogues_history_view(dialogues),
                 "verification": {
                     "all_steps_success": all(r.status in {"success", "meta"} for r in step_results),
                     "failed_steps": [idx for idx, r in enumerate(step_results) if r.status == "error"],
@@ -846,7 +886,8 @@ class AugmentationAgent:
                 },
                 "n_steps": n_steps,
                 "final_sql_generated": final_sql_generated,
-                "final_sql_match": self._normalize_sql(final_sql_generated) == self._normalize_sql(final_sql),
+                "final_sql_match": final_sql_match,
+                "final_sql_match_reason": final_sql_reason,
                 "llm_model": self.args.model_used,
                 "endpoint_type": self.args.endpoint_type_resolved,
                 "openai_base_url": self.args.openai_base_url,
@@ -1108,6 +1149,85 @@ class AugmentationAgent:
         )
         return (safe_json_loads(response) or {}).get("final_sql", fallback_final)
 
+    def _evaluate_final_sql(
+        self,
+        context: Dict[str, str],
+        generated_sql: str,
+        reference_sql: str,
+        dialogues: List[Dict[str, Any]],
+    ) -> Tuple[bool, Optional[str]]:
+        if not generated_sql or not reference_sql:
+            return False, "missing_sql"
+        if self.args.offline or self.detection_client is None:
+            fallback_match = self._normalize_sql(generated_sql) == self._normalize_sql(reference_sql)
+            reason = "offline_fallback"
+            return fallback_match, reason
+
+        prompt = DETECTION_FINAL_STEP_PROMPT.format(
+            step_desc=context.get("user_question", ""),
+            schema_text=context.get("schema_text", ""),
+            ref_text=context.get("ref_text", ""),
+            final_generated_sql=generated_sql,
+            original_final_sql=reference_sql,
+        )
+        dialogues.append(
+            {
+                "role": "user",
+                "content": prompt,
+                "meta": {"prompt_type": "FINAL_SQL_DETECTION_PROMPT"},
+            }
+        )
+
+        detection_error: Optional[str] = None
+        try:
+            response = self.detection_client.invoke(prompt=prompt, temperature=0.0, max_tokens=512)
+            dialogues.append(
+                {
+                    "role": "assistant",
+                    "content": response,
+                    "meta": {"prompt_type": "FINAL_SQL_DETECTION_PROMPT"},
+                }
+            )
+            parsed = safe_json_loads(response) or {}
+            verdict = parsed.get("are_equivalent")
+            if isinstance(verdict, bool):
+                return verdict, parsed.get("reason")
+        except Exception as exc:
+            detection_error = str(exc)
+            self._append_note_dialogue(
+                dialogues,
+                json.dumps({"detection_error": detection_error}, ensure_ascii=False),
+                meta={"prompt_type": "FINAL_SQL_DETECTION_ERROR"},
+            )
+
+        fallback_match = self._normalize_sql(generated_sql) == self._normalize_sql(reference_sql)
+        fallback_reason = f"detection_failed:{detection_error}" if detection_error else "detection_unparsed"
+        return fallback_match, fallback_reason
+
+    @staticmethod
+    def _append_note_dialogue(dialogues: List[Dict[str, Any]], content: str, meta: Optional[Dict[str, Any]] = None) -> None:
+        entry_meta = {"exclude_from_history": True}
+        if meta:
+            entry_meta.update(meta)
+        dialogues.append({
+            "role": "note",
+            "content": content,
+            "meta": entry_meta,
+        })
+
+    @staticmethod
+    def _dialogues_history_view(dialogues: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+        allowed_roles = {"system", "user", "assistant"}
+        filtered: List[Dict[str, str]] = []
+        for entry in dialogues:
+            meta = entry.get("meta") or {}
+            if meta.get("exclude_from_history"):
+                continue
+            role = entry.get("role")
+            if role in allowed_roles:
+                filtered.append({"role": role, "content": entry.get("content", "")})
+        return filtered
+
     @staticmethod
     def _normalize_sql(sql: str) -> str:
         return re.sub(r"\s+", " ", (sql or "").strip()).lower()
@@ -1175,12 +1295,13 @@ def main():
     parser.add_argument("--variants_per_question", type=int, default=1)
     parser.add_argument("--max_step_retries", type=int, default=5)
     parser.add_argument("--limit", type=int, default=-1)
-    parser.add_argument("--llm_model", default="Qwen3-Coder-30B-A3B-Instruct")
+    parser.add_argument("--llm_model", default="")
     parser.add_argument("--decompose_temperature", type=float, default=0.2)
     parser.add_argument("--sqlgen_temperature", type=float, default=0.3)
     parser.add_argument("--revise_temperature", type=float, default=0.1)
     parser.add_argument("--reflection_rounds", type=int, default=0)
     parser.add_argument("--reflection_model", default="")
+    parser.add_argument("--detection_model", default="")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--endpoint_type", choices=["auto", "online", "vllm", "offline"], default="auto")
     parser.add_argument("--corrections_file", default="")
