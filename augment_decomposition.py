@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
+from decimal import Decimal
 
 from dotenv import load_dotenv
 
@@ -37,54 +38,22 @@ load_dotenv(override=True)
 # Prompts (concise, JSON enforced to match spider-agent conventions)
 # ---------------------------------------------------------------------------
 
-META_PLAN_PROMPT = """你是资深数据分析教练。请依据下面的【用户问题】完成第0步的元规划：
-1) 总步数为 {n_steps}，第0步固定为元规划；输出 {sub_steps} 个按顺序排列的子问题标题；
-2) 子问题需覆盖过滤、关联、集合构建、聚合/排序等关键逻辑，并引用上下文实体；
-3) 严格输出 JSON：{{"sub_questions": ["子问题1", "子问题2", ...]}}，长度必须为 {sub_steps}。
-
-【用户问题】
-{user_question}
-
-【数据库schema】
-{schema_text}
-
-【参考信息】
-{ref_text}
-"""
-
-STEP_SQL_ONE_PROMPT = """你是资深MySQL工程师。仅针对以下单步，生成可独立执行的查询（允许CTE）。
-约束：
-1) is_final_step={is_final_step}。若为 false，禁止 COUNT/聚合/完整答案，仅返回中间集合；
-2) 若为 true，输出必须等价于最终MySQL；
-3) 严格输出 JSON：{{"sql": "..."}}。
-
-【步骤描述】
-{step_desc}
-
-【用户问题】
-{user_question}
-
-【数据库schema】
-{schema_text}
-
-【上下文提示】
-{ref_text}
-"""
-
-SCOPE_REVISION_PROMPT = """当前MySQL覆盖范围过大或提前给出最终答案。请仅返回该步骤需要的最小中间查询，禁止聚合。
-输出 JSON：{{"sql": "..."}}。
-
-【步骤描述】
-{step_desc}
-
-【过度SQL】
-{current_sql}
-"""
-
-REVISION_PROMPT = """你生成的MySQL是错误的。请根据错误信息修订MySQL并输出 JSON：{{"revised_sql": "..."}}。
-
-【步骤描述】
-{step_desc}
+META_PLAN_PROMPT = """【角色】你是资深数据分析教练，会在编写 SQL 之前拆解任务。
+【输入】
+- 目标总步数：{n_steps}（第 0 步固定为元规划）
+- 用户问题：见下文
+- 数据库 schema：见下文
+- 参考信息：见下文
+- 原问题 SQL 答案：见下文
+【任务】
+1. 产出 {sub_steps} 个按顺序排列的子问题标题，覆盖过滤、关联、集合构建、聚合/排序等关键逻辑；
+2. 标题需语义明确、避免重复，必要时引用实体或字段；
+3. 所有内容使用中文，且与原问题紧密呼应。
+【输出格式】
+```json
+{{"sub_questions": ["子问题1", "子问题2", ...]}}
+```
+数组长度必须等于 {sub_steps}。
 
 【用户问题】
 {user_question}
@@ -95,58 +64,61 @@ REVISION_PROMPT = """你生成的MySQL是错误的。请根据错误信息修订
 【参考信息】
 {ref_text}
 
-【失败SQL】
-{failed_sql}
-
-【错误信息】
-{error_msg}
-"""
-
-FINAL_SYNTHESIS_PROMPT = """你是资深MySQL工程师。请结合已验证的步骤SQL生成满足原始需求的最终SQL，仅输出 JSON：{{"final_sql": "..."}}。
-
-【用户问题】
-{user_question}
-
-【数据库schema】
-{schema_text}
-
-【参考信息】
-{ref_text}
-
-【步骤与SQL】
-{steps_and_sqls}
-"""
-
-REFLECTION_STEP_PROMPT = """你是资深MySQL专家。
-【用户问题】
-{user_question}
-
-【数据库schema】
-{schema_text}
-
-【标准答案SQL】
+【原问题SQL答案】
 {final_sql}
-
-【所有步骤及其SQL（供参考，避免重复劳动）】
-{all_steps_and_sqls}
-
-【当前步骤】
-步骤{step_idx}: {step_desc}
-
-【当前生成的MySQL】
-{current_sql}
-
-要求：
-1) 当前步骤SQL应对应本步骤的意图，尽量不要与其它步骤已经在做的事情完全重复；
-2) 如果不可避免有重合，也要保证本步骤仍然有独立价值。
-
-请判断当前SQL是否正确（逻辑上是否是标准答案的一个中间步骤，或者与标准答案在当前步骤的意图一致）。
-如果正确，请输出 JSON：{{"is_correct": true}}
-如果不正确，请输出修正后的SQL JSON：{{"is_correct": false, "revised_sql": "..."}}
 """
 
-EXECUTOR_SYSTEM_PROMPT = "你是资深MySQL工程师，会结合全部历史对话逐步生成和修正各子问题的SQL，所有回答必须是JSON格式。"
-REFLECTION_SYSTEM_PROMPT = "你是资深MySQL专家，会参考历史对话逐轮反思并修正每个步骤的SQL。"
+STEP_SQL_ONE_PROMPT = """【角色】你是资深 MySQL 工程师，需在已有对话上下文中继续解决当前步骤。
+【任务说明】
+- 当前步骤：{step_desc}
+- is_final_step={is_final_step}（false 表示仅返回可复用的中间集合，true 必须给出最终答案）
+- 补充提示：{ref_text}
+【写作准则】
+1. 充分承接既有历史，不要重复粘贴上下文；
+2. 当 is_final_step=false 时，输出满足后续需求的最小字段集合，避免聚合/排序；当 is_final_step=true 时，SQL 必须覆盖原问题全部约束；
+3. 仅输出 JSON：{{"sql": "..."}}，SQL 使用标准 MySQL 语法且保持可执行。
+"""
+
+SCOPE_REVISION_PROMPT = """【情景】当前 SQL 覆盖范围过大或提前产出最终答案。
+【目标】仅返回该步骤所需的最小中间结果，禁止聚合或排序。
+【必要信息】
+- 步骤描述：{step_desc}
+- 过度 SQL：{current_sql}
+【输出格式】JSON：{{"sql": "..."}}
+"""
+
+REVISION_PROMPT = """【情景】步骤 SQL 执行失败，需要基于历史上下文重新修订。
+【信息】
+- 步骤描述：{step_desc}
+- 失败 SQL：{failed_sql}
+- 错误信息：{error_msg}
+- 额外提示：{ref_text}
+【要求】指出问题并给出修正后的 SQL，仅输出 JSON：{{"revised_sql": "..."}}，禁止返回其他内容。
+"""
+
+FINAL_SYNTHESIS_PROMPT = """【角色】你是资深 MySQL 工程师，需要将全部已验证的步骤 SQL 汇总为最终答案。
+【上下文】
+- 用户问题：{user_question}
+- 数据库 schema：{schema_text}
+- 参考信息：{ref_text}
+- 步骤及对应 SQL：{steps_and_sqls}
+【要求】在确认所有前置 SQL 可复用的前提下，合成满足原始需求的最终 SQL。仅输出 JSON：{{"final_sql": "..."}}。
+"""
+
+REFLECTION_STEP_PROMPT = """【任务】复核步骤 {step_idx} 的 SQL 是否正确。
+【步骤描述】
+{step_desc}
+【当前 SQL】
+{current_sql}
+【输出规则】
+- 若完全正确：输出 {{"is_correct": true}}
+- 若需修正：输出 {{"is_correct": false, "revised_sql": "...", "reason": "问题定位"}}，说明错误原因并保持与其他步骤不重复。
+"""
+
+EXECUTOR_SYSTEM_PROMPT = "【角色】资深 MySQL 工程师，负责逐步生成/修正子问题 SQL。" \
+    "【要求】始终结合对话历史，输出严格 JSON（含 SQL 字段），遵循 MySQL 只读查询规范。"
+REFLECTION_SYSTEM_PROMPT = "【角色】资深 MySQL 专家，负责基于历史对话复核并修正每个步骤 SQL。" \
+    "【要求】仅输出 JSON 结论或修正，确保与整体意图一致。"
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -168,6 +140,7 @@ class StepSQLResult:
     error: Optional[str] = None
     rows_sample: List[Any] = field(default_factory=list)
     attempts: List[Dict[str, Any]] = field(default_factory=list)
+    versions: List[Dict[str, Any]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +149,14 @@ class StepSQLResult:
 
 RANDOM_SEED = 42
 random.seed(RANDOM_SEED)
+
+
+def _json_default(obj: Any) -> Any:
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if isinstance(obj, set):
+        return list(obj)
+    return str(obj)
 
 
 def safe_json_loads(text: str) -> Optional[Dict[str, Any]]:
@@ -321,6 +302,7 @@ class StepPlanner:
             user_question=context.get("user_question", ""),
             schema_text=context.get("schema_text", ""),
             ref_text=context.get("ref_text", ""),
+            final_sql=final_sql,
         )
         print("[planner] prompt {}...".format(prompt))
         try:
@@ -408,11 +390,15 @@ class StepExecutor:
         self.args = args
         self.chat_history: List[Dict[str, str]] = []
 
-    def reset_history(self, system_prompt: Optional[str] = None):
+    def reset_history(self, context: Optional[Dict[str, str]] = None, system_prompt: Optional[str] = None):
         self.chat_history = []
         base_prompt = system_prompt or EXECUTOR_SYSTEM_PROMPT
         if base_prompt:
             self.chat_history.append({"role": "system", "content": base_prompt})
+        if context:
+            seed = self._compose_context_seed(context)
+            if seed:
+                self.chat_history.append({"role": "user", "content": seed})
 
     def _history_snapshot(self) -> List[Dict[str, str]]:
         return [msg.copy() for msg in self.chat_history]
@@ -425,10 +411,26 @@ class StepExecutor:
             temperature=temperature,
             max_tokens=max_tokens,
             messages=self._history_snapshot(),
-            prompt=user_prompt,
         )
         self.chat_history.append({"role": "assistant", "content": response})
         return response
+
+    @staticmethod
+    def _compose_context_seed(context: Dict[str, str]) -> str:
+        parts = []
+        uq = context.get("user_question")
+        schema = context.get("schema_text")
+        ref = context.get("ref_text")
+        final_sql = context.get("final_sql")
+        if uq:
+            parts.append(f"【用户问题】\n{uq}")
+        if schema:
+            parts.append(f"【数据库schema】\n{schema}")
+        if ref:
+            parts.append(f"【参考信息】\n{ref}")
+        if final_sql:
+            parts.append(f"【原问题SQL答案】\n{final_sql}")
+        return "\n\n".join(parts)
 
     def run_step(
         self,
@@ -500,7 +502,27 @@ class StepExecutor:
             current_sql = self._revise_sql(step, current_sql, last_error, dialogues, enriched_context)
 
         status = "success" if success else "error"
-        return StepSQLResult(step, sql=current_sql, status=status, error=last_error, rows_sample=last_rows_sample, attempts=attempts)
+        versions: List[Dict[str, Any]] = []
+        if success:
+            versions.append(
+                {
+                    "round": 0,
+                    "sql": current_sql,
+                    "status": "success",
+                    "rows_sample": last_rows_sample,
+                    "error": None,
+                    "reason": None,
+                }
+            )
+        return StepSQLResult(
+            step,
+            sql=current_sql,
+            status=status,
+            error=last_error,
+            rows_sample=last_rows_sample,
+            attempts=attempts,
+            versions=versions,
+        )
 
     def _generate_sql(
         self,
@@ -515,23 +537,20 @@ class StepExecutor:
 
         prompt = STEP_SQL_ONE_PROMPT.format(
             step_desc=step.desc,
-            user_question=context.get("user_question", ""),
-            schema_text=context.get("schema_text", ""),
             ref_text=context.get("ref_text", ""),
             is_final_step=str(is_final_step).lower(),
         )
         # 记录完整的 prompt 方便离线分析
-        dialogues.append({
-            "role": "user",
-            "content": json.dumps(
-                {
+        dialogues.append(
+            {
+                "role": "user",
+                "content": prompt,
+                "meta": {
                     "prompt_type": "STEP_SQL_ONE_PROMPT",
                     "is_final_step": is_final_step,
-                    "raw_prompt": prompt,
                 },
-                ensure_ascii=False,
-            ),
-        })
+            }
+        )
         response = self._chat_completion(prompt, self.args.sqlgen_temperature, 4096) if self.llm_client else ""
         parsed = safe_json_loads(response) or {}
         sql = parsed.get("sql")
@@ -543,24 +562,35 @@ class StepExecutor:
             norm_sql = re.sub(r"\s+", " ", sql.strip()).lower()
             if norm_sql == norm_final or "count(" in norm_sql or "group by" in norm_sql:
                 scope_prompt = SCOPE_REVISION_PROMPT.format(step_desc=step.desc, current_sql=sql)
-                dialogues.append({
-                    "role": "user",
-                    "content": json.dumps(
-                        {
+                dialogues.append(
+                    {
+                        "role": "user",
+                        "content": scope_prompt,
+                        "meta": {
                             "prompt_type": "SCOPE_REVISION_PROMPT",
-                            "raw_prompt": scope_prompt,
                         },
-                        ensure_ascii=False,
-                    ),
-                })
+                    }
+                )
                 correction = self._chat_completion(scope_prompt, self.args.sqlgen_temperature, 8192) if self.llm_client else ""
-                dialogues.append({"role": "assistant", "content": correction})
+                dialogues.append(
+                    {
+                        "role": "assistant",
+                        "content": correction,
+                        "meta": {"prompt_type": "SCOPE_REVISION_PROMPT"},
+                    }
+                )
                 sql = (safe_json_loads(correction) or {}).get("sql", sql)
 
-        dialogues.append({
-            "role": "assistant",
-            "content": json.dumps({"sql": sql}, ensure_ascii=False),
-        })
+        dialogues.append(
+            {
+                "role": "assistant",
+                "content": response,
+                "meta": {
+                    "prompt_type": "STEP_SQL_ONE_PROMPT",
+                    "parsed_sql": sql,
+                },
+            }
+        )
         return sql
 
     def _revise_sql(
@@ -575,27 +605,33 @@ class StepExecutor:
             return failed_sql
         prompt = REVISION_PROMPT.format(
             step_desc=step.desc,
-            user_question=context.get("user_question", ""),
-            schema_text=context.get("schema_text", ""),
-            ref_text=context.get("ref_text", ""),
             failed_sql=failed_sql,
             error_msg=error_msg or "Execution error",
+            ref_text=context.get("ref_text", ""),
         )
         # 记录完整的 SQL 自修正 prompt
-        dialogues.append({
-            "role": "user",
-            "content": json.dumps(
-                {
+        dialogues.append(
+            {
+                "role": "user",
+                "content": prompt,
+                "meta": {
                     "prompt_type": "REVISION_PROMPT",
                     "error_msg": error_msg,
-                    "raw_prompt": prompt,
                 },
-                ensure_ascii=False,
-            ),
-        })
+            }
+        )
         response = self._chat_completion(prompt, self.args.revise_temperature, 8192)
         revised = (safe_json_loads(response) or {}).get("revised_sql", failed_sql)
-        dialogues.append({"role": "assistant", "content": json.dumps({"revised_sql": revised}, ensure_ascii=False)})
+        dialogues.append(
+            {
+                "role": "assistant",
+                "content": response,
+                "meta": {
+                    "prompt_type": "REVISION_PROMPT",
+                    "parsed_sql": revised,
+                },
+            }
+        )
         self._log_correction(step, failed_sql, revised, error_msg)
         return revised
 
@@ -614,7 +650,7 @@ class StepExecutor:
         }
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as fw:
-            fw.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            fw.write(json.dumps(payload, ensure_ascii=False, default=_json_default) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -682,7 +718,7 @@ class StreamJsonArrayWriter:
             self._fh.write(",\n")
         else:
             self._first = False
-        self._fh.write(json.dumps(obj, ensure_ascii=False, indent=2))
+        self._fh.write(json.dumps(obj, ensure_ascii=False, indent=2, default=_json_default))
         self._fh.flush()
 
     def __exit__(self, exc_type, exc, tb):
@@ -731,6 +767,7 @@ class AugmentationAgent:
         final_sql = record.get("sql") or record.get("output") or ""
         if not final_sql or not context_raw.get("user_question"):
             return []
+        context_raw["final_sql"] = final_sql
 
         variants: List[Dict[str, Any]] = []
         for vidx in range(self.args.variants_per_question):
@@ -743,7 +780,13 @@ class AugmentationAgent:
                 }
             ]
 
-            self.executor.reset_history()
+            # 记录执行代理的系统提示与上下文种子，确保对话日志完整
+            dialogues.append({"role": "system", "content": EXECUTOR_SYSTEM_PROMPT})
+            seed_for_log = self.executor._compose_context_seed(context_raw)
+            if seed_for_log:
+                dialogues.append({"role": "system", "content": seed_for_log, "meta": {"type": "context_seed"}})
+
+            self.executor.reset_history(context_raw)
 
             validated_sqls: List[str] = []
             step_results: List[StepSQLResult] = []
@@ -767,9 +810,14 @@ class AugmentationAgent:
                 step_results = self._reflect_and_refine(context_raw, steps, step_results, final_sql, dialogues, r_idx)
             validated_sqls = [r.sql for r in step_results]
 
-            dialogues.append({"role": "user", "content": "请基于已验证SQL生成最终答案"})
-            final_sql_generated = self._synthesize_final(context_raw, steps, validated_sqls, final_sql)
-            dialogues.append({"role": "assistant", "content": json.dumps({"final_sql": final_sql_generated}, ensure_ascii=False)})
+            final_sql_generated = self._synthesize_final(context_raw, steps, validated_sqls, final_sql, dialogues)
+            step_sql_versions = [
+                {
+                    "step_index": idx,
+                    "versions": [entry.copy() for entry in res.versions],
+                }
+                for idx, res in enumerate(step_results)
+            ]
 
             variant = {
                 "original_id": record.get("question_id"),
@@ -783,6 +831,7 @@ class AugmentationAgent:
                 "step_exec_status": [res.status for res in step_results],
                 "step_exec_errors": [res.error for res in step_results],
                 "step_rows_sample": [res.rows_sample for res in step_results],
+                "step_sql_versions": step_sql_versions,
                 "dialogues": dialogues,
                 "verification": {
                     "all_steps_success": all(r.status in {"success", "meta"} for r in step_results),
@@ -836,30 +885,50 @@ class AugmentationAgent:
             reflection_history: List[Dict[str, str]] = [
                 {"role": "system", "content": REFLECTION_SYSTEM_PROMPT}
             ]
+            dialogues.append(
+                {
+                    "role": "system",
+                    "content": REFLECTION_SYSTEM_PROMPT,
+                    "meta": {
+                        "prompt_type": "REFLECTION_SYSTEM_PROMPT",
+                        "round": round_idx + 1,
+                        "step_index": idx,
+                    },
+                }
+            )
+            seed = self._compose_reflection_seed(context, final_sql, all_steps_bundle)
+            if seed:
+                reflection_history.append({"role": "user", "content": seed})
+                dialogues.append(
+                    {
+                        "role": "system",
+                        "content": seed,
+                        "meta": {
+                            "prompt_type": "REFLECTION_CONTEXT_SEED",
+                            "round": round_idx + 1,
+                            "step_index": idx,
+                        },
+                    }
+                )
 
             # Prompt for this step（带上标准答案 SQL + 所有步骤SQL，仅用于评估/修正当前子 SQL，不直接替换）
             prompt = REFLECTION_STEP_PROMPT.format(
-                user_question=context.get("user_question", ""),
-                schema_text=context.get("schema_text", ""),
-                final_sql=final_sql,
-                all_steps_and_sqls=all_steps_bundle,
                 step_idx=idx,
                 step_desc=step.desc,
                 current_sql=res.sql,
             )
 
-            dialogues.append({
-                "role": "user",
-                "content": json.dumps(
-                    {
+            dialogues.append(
+                {
+                    "role": "user",
+                    "content": prompt,
+                    "meta": {
                         "prompt_type": "REFLECTION_STEP_PROMPT",
                         "round": round_idx + 1,
                         "step_index": idx,
-                        "raw_prompt": prompt,
                     },
-                    ensure_ascii=False,
-                ),
-            })
+                }
+            )
 
             try:
                 reflection_history.append({"role": "user", "content": prompt})
@@ -867,13 +936,23 @@ class AugmentationAgent:
                     temperature=0.1,
                     max_tokens=2048,
                     messages=[msg.copy() for msg in reflection_history],
-                    prompt=prompt,
                 )
                 reflection_history.append({"role": "assistant", "content": response})
-                dialogues.append({"role": "assistant", "content": response})
+                dialogues.append(
+                    {
+                        "role": "assistant",
+                        "content": response,
+                        "meta": {
+                            "prompt_type": "REFLECTION_STEP_PROMPT",
+                            "round": round_idx + 1,
+                            "step_index": idx,
+                        },
+                    }
+                )
                 
                 data = safe_json_loads(response)
                 if data and not data.get("is_correct") and "revised_sql" in data:
+                    diagnosis_reason = data.get("reason")
                     # 在单轮反思中，允许多次修正+执行尝试，受 max_step_retries 控制
                     max_try = max(1, getattr(self.args, "max_step_retries", 2))
                     base_attempts = res.attempts.copy()
@@ -917,30 +996,60 @@ class AugmentationAgent:
                             step_desc=step.desc,
                             current_sql=current_sql,
                         )
-                        dialogues.append({
-                            "role": "user",
-                            "content": json.dumps(
-                                {
+                        supplementary: List[str] = []
+                        if diagnosis_reason:
+                            supplementary.append(f"上一轮诊断：{diagnosis_reason}")
+                        if last_error:
+                            supplementary.append(f"最新执行错误：{last_error}")
+                        if supplementary:
+                            follow_prompt = f"{follow_prompt}\n【补充线索】\n" + "\n".join(supplementary)
+                        dialogues.append(
+                            {
+                                "role": "user",
+                                "content": follow_prompt,
+                                "meta": {
                                     "prompt_type": "REFLECTION_STEP_PROMPT_CONTINUE",
                                     "round": round_idx + 1,
                                     "step_index": idx,
                                     "try": local_try + 1,
-                                    "raw_prompt": follow_prompt,
                                     "last_error": last_error,
                                 },
-                                ensure_ascii=False,
-                            ),
-                        })
+                            }
+                        )
                         reflection_history.append({"role": "user", "content": follow_prompt})
                         follow_resp = self.reflection_client.invoke(
                             temperature=0.1,
                             max_tokens=2048,
                             messages=[msg.copy() for msg in reflection_history],
-                            prompt=follow_prompt,
                         )
                         reflection_history.append({"role": "assistant", "content": follow_resp})
-                        dialogues.append({"role": "assistant", "content": follow_resp})
+                        dialogues.append(
+                            {
+                                "role": "assistant",
+                                "content": follow_resp,
+                                "meta": {
+                                    "prompt_type": "REFLECTION_STEP_PROMPT_CONTINUE",
+                                    "round": round_idx + 1,
+                                    "step_index": idx,
+                                    "try": local_try + 1,
+                                },
+                            }
+                        )
                         data = safe_json_loads(follow_resp) or {}
+                        diagnosis_reason = data.get("reason")
+
+                    version_history = [entry.copy() for entry in res.versions]
+                    if exec_result["status"] == "success":
+                        version_history.append(
+                            {
+                                "round": round_idx + 1,
+                                "sql": current_sql,
+                                "status": "success",
+                                "rows_sample": exec_result.get("rows_sample", []),
+                                "error": None,
+                                "reason": diagnosis_reason,
+                            }
+                        )
 
                     new_res = StepSQLResult(
                         plan=res.plan,
@@ -949,6 +1058,7 @@ class AugmentationAgent:
                         error=last_error,
                         rows_sample=exec_result.get("rows_sample", []),
                         attempts=base_attempts,
+                        versions=version_history,
                     )
                     new_results.append(new_res)
                 else:
@@ -965,7 +1075,7 @@ class AugmentationAgent:
         non_meta_indices = [i for i, step in enumerate(steps) if not step.meta]
         return bool(non_meta_indices) and idx == non_meta_indices[-1]
 
-    def _synthesize_final(self, context: Dict[str, str], steps: List[StepPlan], validated_sqls: List[str], fallback_final: str) -> str:
+    def _synthesize_final(self, context: Dict[str, str], steps: List[StepPlan], validated_sqls: List[str], fallback_final: str, dialogues: List[Dict[str, Any]]) -> str:
         if self.args.offline or self.executor.llm_client is None:
             return fallback_final
         bundle = json.dumps(
@@ -981,12 +1091,41 @@ class AugmentationAgent:
             ref_text=context.get("ref_text", ""),
             steps_and_sqls=bundle,
         )
-        response = self.executor.llm_client.invoke(prompt, temperature=self.args.sqlgen_temperature, max_tokens=1024)
+        dialogues.append(
+            {
+                "role": "user",
+                "content": prompt,
+                "meta": {"prompt_type": "FINAL_SYNTHESIS_PROMPT"},
+            }
+        )
+        response = self.executor.llm_client.invoke(prompt=prompt, temperature=self.args.sqlgen_temperature, max_tokens=1024)
+        dialogues.append(
+            {
+                "role": "assistant",
+                "content": response,
+                "meta": {"prompt_type": "FINAL_SYNTHESIS_PROMPT"},
+            }
+        )
         return (safe_json_loads(response) or {}).get("final_sql", fallback_final)
 
     @staticmethod
     def _normalize_sql(sql: str) -> str:
         return re.sub(r"\s+", " ", (sql or "").strip()).lower()
+
+    @staticmethod
+    def _compose_reflection_seed(context: Dict[str, str], final_sql: str, all_steps_bundle: str) -> str:
+        sections = []
+        if context.get("user_question"):
+            sections.append(f"【用户问题】\n{context['user_question']}")
+        if context.get("schema_text"):
+            sections.append(f"【数据库schema】\n{context['schema_text']}")
+        if final_sql:
+            sections.append(f"【标准答案SQL】\n{final_sql}")
+        if context.get("ref_text"):
+            sections.append(f"【参考信息】\n{context['ref_text']}")
+        if all_steps_bundle:
+            sections.append(f"【所有步骤及SQL】\n{all_steps_bundle}")
+        return "\n\n".join(sections)
 
 
 # ---------------------------------------------------------------------------
@@ -1034,13 +1173,13 @@ def main():
     parser.add_argument("--min_steps", type=int, default=2)
     parser.add_argument("--max_steps", type=int, default=4)
     parser.add_argument("--variants_per_question", type=int, default=1)
-    parser.add_argument("--max_step_retries", type=int, default=2)
+    parser.add_argument("--max_step_retries", type=int, default=5)
     parser.add_argument("--limit", type=int, default=-1)
     parser.add_argument("--llm_model", default="Qwen3-Coder-30B-A3B-Instruct")
     parser.add_argument("--decompose_temperature", type=float, default=0.2)
     parser.add_argument("--sqlgen_temperature", type=float, default=0.3)
     parser.add_argument("--revise_temperature", type=float, default=0.1)
-    parser.add_argument("--reflection_rounds", type=int, default=1)
+    parser.add_argument("--reflection_rounds", type=int, default=0)
     parser.add_argument("--reflection_model", default="")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--endpoint_type", choices=["auto", "online", "vllm", "offline"], default="auto")
